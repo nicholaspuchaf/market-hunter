@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, stages, type Job, type Source, type Run, type Stage, type Revision } from './api';
+  import { companySuggestions } from './companySuggestions';
 
   let jobs = $state<Job[]>([]);
   let sources = $state<Source[]>([]);
@@ -8,6 +9,9 @@
   let page = $state('discover');
   let loading = $state(true);
   let collecting = $state(false);
+  let restoringHidden = $state(false);
+  let selectedCompanies = $state<number[]>([]);
+  let companySelectionReady = false;
   let saving = $state(false);
   let error = $state('');
   let message = $state('');
@@ -27,8 +31,22 @@
   let draftStage = $state<Stage>('new');
   let dirty = $state(false);
   let revisions = $state<Revision[]>([]);
-  let sourceName = $state('');
-  let sourceBoard = $state('');
+  let sourceUrl = $state('');
+  let resolvedSource = $state<{ name: string; board: string; url: string } | null>(null);
+  let resolvingSource = $state(false);
+  let sourceResolveError = $state('');
+  let removingSources = $state<number[]>([]);
+  let resolveSequence = 0;
+  let showCompanySuggestions = $state(false);
+  let addingSuggestedBoard = $state<string | null>(null);
+
+  $effect(() => {
+    const url = sourceUrl.trim();
+    resolvedSource = null; sourceResolveError = ''; resolvingSource = false;
+    if (!url) return;
+    const timer = setTimeout(() => identifySource(url), 600);
+    return () => clearTimeout(timer);
+  });
   let detailsDialog = $state<HTMLDialogElement>();
   const areas = ['Desenvolvimento', 'DevOps', 'Infraestrutura', 'IA', 'Dados', 'Segurança', 'Suporte de TI', 'Tecnologia'];
   const seniorityOptions = ['Estágio', 'Júnior', 'Pleno', 'Sênior', 'Tech Lead', 'Especialista', 'Liderança', 'Não informada'];
@@ -61,6 +79,9 @@
       && !job.affirmative_tags.some(group => excludedGroups.includes(group))
       && (!levels.length || levels.some(value => (job.seniority_tags.length ? job.seniority_tags : ['Não informada']).includes(value)));
   }));
+  const selectedSources = $derived(sources.filter(source => selectedCompanies.includes(source.id)));
+  const hiddenInSelection = $derived(jobs.filter(job => job.hidden && selectedCompanies.includes(job.source_id)).length);
+  const companySelectionLabel = $derived(selectedCompanies.length === 0 ? 'Nenhuma empresa' : selectedCompanies.length === sources.length ? 'Todas as empresas' : selectedSources.length === 1 ? selectedSources[0].name : `${selectedSources.length} empresas`);
   const recentSuccess = $derived(sources.map(source => source.last_success).filter((date): date is string => !!date).sort().at(-1));
 
   function date(value?: string | null) {
@@ -71,7 +92,12 @@
     const [newJobs, newSources, newRuns] = await Promise.all([
       api<Job[]>('/jobs'), api<Source[]>('/sources'), api<Run[]>('/runs'),
     ]);
+    const allWereSelected = companySelectionReady && sources.length > 0 && sources.every(source => selectedCompanies.includes(source.id));
+    if (!companySelectionReady || allWereSelected) selectedCompanies = newSources.map(source => source.id);
+    else selectedCompanies = selectedCompanies.filter(id => newSources.some(source => source.id === id));
+    companySelectionReady = true;
     jobs = newJobs; sources = newSources; runs = newRuns;
+    if (company && !sources.some(source => source.name === company)) company = '';
   }
 
   onMount(async () => {
@@ -80,9 +106,11 @@
   });
 
   async function collect() {
+    if (!selectedCompanies.length) { error = 'Selecione ao menos uma empresa para buscar vagas.'; return; }
+    const sourceIds = [...selectedCompanies];
     collecting = true; error = ''; message = '';
     try {
-      const result = await api<{ results: { source: string; status: string; count?: number }[] }>('/collect', 'POST');
+      const result = await api<{ results: { source: string; status: string; count?: number }[] }>('/collect', 'POST', { source_ids: sourceIds });
       await refresh();
       const failures = result.results.filter(item => item.status === 'error');
       if (failures.length) error = `Não foi possível atualizar: ${failures.map(item => item.source).join(', ')}. Veja o motivo em Fontes. As vagas salvas foram preservadas.`;
@@ -90,6 +118,19 @@
       else message = 'Coleta concluída. Suas oportunidades estão atualizadas.';
     } catch (err) { error = (err as Error).message; }
     finally { collecting = false; }
+  }
+
+  async function restoreHidden() {
+    if (restoringHidden || !hiddenInSelection || pendingJobs.length) return;
+    const sourceIds = [...selectedCompanies];
+    restoringHidden = true; error = ''; message = '';
+    try {
+      const result = await api<{ restored_count: number; restored_ids: number[] }>('/jobs/restore-hidden', 'POST', { source_ids: sourceIds });
+      const restored = new Set(result.restored_ids);
+      jobs = jobs.map(job => restored.has(job.id) ? { ...job, hidden: false } : job);
+      message = `${result.restored_count} vaga(s) restaurada(s) para reavaliação. Os filtros da listagem continuam valendo.`;
+    } catch (err) { error = (err as Error).message; }
+    finally { restoringHidden = false; }
   }
 
   function canLeave() { return !dirty || window.confirm('Descartar as alterações ainda não salvas?'); }
@@ -103,7 +144,7 @@
     message = ''; error = '';
   }
   async function favorite(job: Job) {
-    if (pendingJobs.includes(job.id)) return;
+    if (restoringHidden || pendingJobs.includes(job.id)) return;
     pendingJobs = [...pendingJobs, job.id];
     error = '';
     try {
@@ -113,7 +154,7 @@
     finally { pendingJobs = pendingJobs.filter(id => id !== job.id); }
   }
   async function toggleHidden(job: Job) {
-    if (pendingJobs.includes(job.id)) return;
+    if (restoringHidden || pendingJobs.includes(job.id)) return;
     pendingJobs = [...pendingJobs, job.id];
     error = '';
     try {
@@ -142,13 +183,49 @@
       if (selectedId === id) { revisions = items; if (!items.length) message = 'Nenhuma alteração de descrição registrada.'; }
     } catch (err) { error = (err as Error).message; }
   }
-  async function addSource(event: SubmitEvent) {
-    event.preventDefault(); saving = true; error = '';
+  async function identifySource(url: string) {
+    const sequence = ++resolveSequence;
+    resolvingSource = true; sourceResolveError = '';
     try {
-      await api('/sources', 'POST', { name: sourceName.trim(), board: sourceBoard.trim() });
-      sourceName = ''; sourceBoard = ''; await refresh(); message = 'Fonte cadastrada. Clique em Buscar vagas para consultar.';
+      const result = await api<{ name: string; board: string; url: string }>('/sources/resolve', 'POST', { url });
+      if (sequence === resolveSequence && sourceUrl.trim() === url) resolvedSource = result;
+    } catch (err) {
+      if (sequence === resolveSequence && sourceUrl.trim() === url) sourceResolveError = (err as Error).message;
+    } finally {
+      if (sequence === resolveSequence && sourceUrl.trim() === url) resolvingSource = false;
+    }
+  }
+  async function addSource(event: SubmitEvent) {
+    event.preventDefault();
+    if (!resolvedSource || saving || resolvingSource) return;
+    await addCompanyByUrl(sourceUrl.trim(), true);
+  }
+  async function addSuggestedCompany(board: string) {
+    if (saving || sources.some(source => source.board.toLowerCase() === board)) return;
+    addingSuggestedBoard = board;
+    try { await addCompanyByUrl(`https://job-boards.greenhouse.io/${board}`); }
+    finally { addingSuggestedBoard = null; }
+  }
+  async function addCompanyByUrl(url: string, clearInput = false) {
+    saving = true; error = '';
+    try {
+      const result = await api<{ id: number; name: string }>('/sources', 'POST', { url });
+      if (clearInput) { sourceUrl = ''; resolvedSource = null; }
+      await refresh();
+      if (!selectedCompanies.includes(result.id)) selectedCompanies = [...selectedCompanies, result.id];
+      message = `${result.name} adicionada. Clique em Buscar vagas para consultar.`;
     } catch (err) { error = (err as Error).message; }
     finally { saving = false; }
+  }
+  async function removeSource(source: Source) {
+    if (removingSources.includes(source.id)) return;
+    removingSources = [...removingSources, source.id]; error = '';
+    try {
+      await api(`/sources/${source.id}`, 'DELETE');
+      await refresh();
+      message = `${source.name} removida das empresas acompanhadas. O histórico pode ser recuperado ao adicioná-la novamente.`;
+    } catch (err) { error = (err as Error).message; }
+    finally { removingSources = removingSources.filter(id => id !== source.id); }
   }
   async function toggleSource(source: Source) {
     try { await api(`/sources/${source.id}`, 'PATCH', { enabled: !source.enabled }); await refresh(); }
@@ -220,8 +297,30 @@
 <h1>{page === 'sources' ? 'Seu radar começa aqui.' : page === 'favorites' ? 'Vale ficar de olho.' : page === 'hidden' ? 'Fora do radar. Sempre recuperáveis.' : page === 'applications' ? 'Cada passo, no seu tempo.' : 'Seu próximo passo começa aqui.'}</h1>
 <p class="subtitle">{page === 'sources' ? 'Escolha quais empresas acompanhar e confira a saúde das coletas.' : page === 'favorites' ? 'As oportunidades que você escolheu acompanhar mais de perto.' : page === 'hidden' ? 'Vagas que você ocultou. Restaure quando quiser vê-las nas oportunidades.' : page === 'applications' ? 'Organize processos, entrevistas e o que você aprendeu pelo caminho.' : 'Oportunidades reunidas para você encontrar o que faz sentido.'}</p>
 </div>
-<button class="primary" onclick={collect} disabled={collecting || loading}>
-<span class:spinning={collecting}>↻</span> {collecting ? 'Buscando vagas…' : 'Buscar vagas'}</button>
+<div class="collection-actions">
+  <div class="collection-controls">
+    <details class="company-picker">
+      <summary aria-label="Selecionar empresas para buscar e restaurar vagas">{companySelectionLabel}<span aria-hidden="true">⌄</span></summary>
+      <div class="company-picker-menu">
+        <p>Buscar e restaurar destas empresas</p>
+        <div class="company-picker-shortcuts">
+          <button onclick={() => selectedCompanies = sources.map(source => source.id)} disabled={collecting || restoringHidden}>Todas</button>
+          <button onclick={() => selectedCompanies = []} disabled={collecting || restoringHidden}>Nenhuma</button>
+        </div>
+        {#each sources as source}
+          <label><input type="checkbox" bind:group={selectedCompanies} value={source.id} disabled={collecting || restoringHidden} /><span>{source.name}{#if !source.enabled}<small>Coleta pausada</small>{/if}</span></label>
+        {:else}<p>Nenhuma empresa cadastrada.</p>{/each}
+      </div>
+    </details>
+    <button class="primary" onclick={collect} disabled={collecting || restoringHidden || loading || !selectedSources.some(source => source.enabled)}>
+      <span class:spinning={collecting}>↻</span> {collecting ? 'Buscando vagas…' : 'Buscar vagas'}
+    </button>
+  </div>
+  <button class="restore-hidden-button" onclick={restoreHidden} disabled={restoringHidden || collecting || loading || !hiddenInSelection || pendingJobs.length > 0}
+    title="Retira dos ocultos todas as vagas das empresas selecionadas, inclusive fora dos filtros atuais">
+    <span aria-hidden="true">↶</span> {restoringHidden ? 'Restaurando…' : `Restaurar ocultas (${hiddenInSelection})`}
+  </button>
+</div>
 </div>
       {#if error}<div class="notice error" role="alert">{error}<button aria-label="Fechar erro" onclick={() => error = ''}>×</button>
 </div>{/if}
@@ -257,6 +356,38 @@
 
       {#if page === 'sources'}
         <section class="sources-section">
+<form class="source-form source-url-form" onsubmit={addSource}>
+  <div class="source-form-heading">
+    <span class="section-marker" aria-hidden="true">+</span>
+    <div><h3>Adicionar empresa</h3><p class="muted">Cole o link da Greenhouse. Identificamos o nome da empresa para você.</p></div>
+    <button type="button" class="company-discovery-toggle" aria-label="Lista especial de empresas tech" aria-expanded={showCompanySuggestions} aria-controls="company-suggestions" title="Descobrir empresas tech" onclick={() => showCompanySuggestions = !showCompanySuggestions}>✦</button>
+  </div>
+  {#if showCompanySuggestions}
+    <section class="company-suggestions" id="company-suggestions" aria-labelledby="company-suggestions-title">
+      <div class="company-suggestions-heading"><span class="eyebrow">UM ATALHO PARA O SEU RADAR</span><h4 id="company-suggestions-title">Empresas para descobrir</h4><p>Quadros conhecidos com oportunidades em tecnologia. Escolha quais acompanhar.</p></div>
+      <div class="company-suggestions-grid">
+        {#each companySuggestions as suggestion}
+          {@const added = sources.some(source => source.board.toLowerCase() === suggestion.board)}
+          <div class="company-suggestion" class:already-added={added}>
+            <div><strong>{suggestion.name}</strong><small>{suggestion.focus}</small><a href={`https://job-boards.greenhouse.io/${suggestion.board}`} target="_blank" rel="noopener noreferrer">Ver quadro ↗</a></div>
+            <button type="button" class="secondary" disabled={added || saving || loading || removingSources.length > 0} aria-label={added ? `${suggestion.name} já adicionada` : `Adicionar ${suggestion.name}`} onclick={() => addSuggestedCompany(suggestion.board)}>{added ? 'Adicionada ✓' : addingSuggestedBoard === suggestion.board ? 'Adicionando…' : '+ Adicionar'}</button>
+          </div>
+        {/each}
+      </div>
+      <p class="company-suggestions-note">O nome é confirmado na Greenhouse ao adicionar. As vagas e os locais disponíveis variam; use Buscar vagas depois do cadastro.</p>
+    </section>
+  {/if}
+  <div class="form-row">
+    <label>URL do quadro ou de uma vaga<input required maxlength="2048" inputmode="url" autocomplete="url" bind:value={sourceUrl} disabled={saving} aria-describedby="source-url-status" placeholder="https://job-boards.greenhouse.io/vtex" /></label>
+    <button class="primary" disabled={saving || resolvingSource || !resolvedSource}>{saving ? 'Adicionando…' : 'Adicionar empresa'}</button>
+  </div>
+  <div id="source-url-status" class="source-url-status" aria-live="polite">
+    {#if resolvingSource}<span>Identificando empresa…</span>
+    {:else if sourceResolveError}<span class="source-url-error">{sourceResolveError}</span><button type="button" class="text-button" onclick={() => identifySource(sourceUrl.trim())}>Tentar novamente</button>
+    {:else if resolvedSource}<div class="source-resolved"><span class="company-icon">{resolvedSource.name.slice(0, 2)}</span><div><strong>{resolvedSource.name}</strong><small>Greenhouse · {resolvedSource.board}</small></div><span class="source-resolved-check" aria-label="Empresa identificada">✓</span></div>
+    {:else}<span>Aceita links job-boards.greenhouse.io e boards.greenhouse.io.</span>{/if}
+  </div>
+</form>
 <div class="section-title">
 <h2>Empresas acompanhadas</h2>
 <span>Greenhouse</span>
@@ -270,18 +401,10 @@
 </div>
 <p>{source.job_count} vagas abertas salvas</p>
 <small>Última coleta: {date(source.last_success)}</small>{#if source.last_error}<p class="source-error">{source.last_error}</p>{/if}<button class="secondary" onclick={() => toggleSource(source)}>{source.enabled ? 'Pausar fonte' : 'Ativar fonte'}</button>
-</article>{/each}</div>
-          <form class="source-form" onsubmit={addSource}>
-<h3>Adicionar empresa na Greenhouse</h3>
-<p class="muted">Use o identificador do endereço job-boards.greenhouse.io/<strong>empresa</strong>.</p>
-<div class="form-row">
-<label>Nome da empresa<input required maxlength="100" bind:value={sourceName} placeholder="Ex.: Minha empresa" />
-</label>
-<label>Identificador do quadro<input required pattern={'[a-zA-Z0-9_-]{1,100}'} bind:value={sourceBoard} placeholder="Ex.: ifoodcarreiras" />
-</label>
-<button class="primary" disabled={saving}>Adicionar fonte</button>
-</div>
-</form>
+<button class="remove-source" disabled={removingSources.includes(source.id) || collecting} onclick={() => removeSource(source)}>{removingSources.includes(source.id) ? 'Removendo…' : 'Remover empresa'}</button>
+</article>{:else}<div class="no-sources">Nenhuma empresa acompanhada. Cole uma URL acima para começar.</div>{/each}</div>
+<p class="muted source-removal-note">Remover uma empresa retira suas vagas das listas. Ao adicionar a mesma empresa novamente, seu histórico é recuperado.</p>
+
           <div class="section-title">
 <h2>Últimas coletas</h2>
 </div>

@@ -10,7 +10,81 @@ backend/collector/    Coleta Greenhouse, classificação e execução agendada
 backend/tests/        Testes de coleta, persistência e API
 ```
 
-## Rodar o MVP
+## Rodar com Docker: um comando por dia
+
+Pré-requisitos: Docker Engine com o plugin Compose v2.20+ ou Docker Desktop,
+com o Docker iniciado e acessível ao seu usuário. Não precisa instalar Python,
+Node, pnpm ou uv no computador para usar o container.
+
+Na raiz do repositório:
+
+```sh
+./iniciar.sh
+```
+
+O script funciona em Linux e macOS com Bash. Na primeira execução, constrói a
+imagem e baixa as dependências; nas seguintes, reutiliza a imagem. Ele sobe um
+único serviço, espera a API ficar pronta, consulta fontes com atualização pendente
+e abre o navegador em **http://127.0.0.1:8080**. Em terminal sem ambiente gráfico,
+mostra o endereço. Se uma fonte falhar, o painel continua disponível.
+
+FastAPI serve `/api` e o frontend Svelte compilado pelo Vite. A imagem final não
+inclui Node, pnpm, uv, ferramentas de teste nem servidores de desenvolvimento.
+O processo permanente é o Uvicorn. O coletor só roda como tarefa curta a cada
+invocação do script; não há coleta periódica em segundo plano neste modo.
+
+O script pode ser chamado mesmo se o container já estiver ligado: ele verifica
+as coletas pendentes novamente. Por padrão, respeita o intervalo de **48 horas**
+por fonte. Para consultar diariamente, copie `.env.example` para `.env` e defina:
+
+```dotenv
+MARKET_HUNTER_PORT=8080
+MARKET_HUNTER_INTERVAL_HOURS=24
+```
+
+O intervalo conta a última tentativa, incluindo falhas. O botão **Buscar vagas**
+continua permitindo atualização manual, com o intervalo mínimo de um minuto.
+
+Opções úteis:
+
+```sh
+./iniciar.sh --build                # Reconstruir após alterar o código
+./iniciar.sh --no-collect           # Somente abrir o painel
+./iniciar.sh --no-browser           # Não abrir uma aba no navegador
+docker compose stop app            # Parar sem remover os dados
+docker compose logs --tail=100 app # Consultar logs da API
+```
+
+O script monta a pasta **backend/data/** em `/data`, reutilizando o banco atual
+com favoritos, ocultos, notas e histórico. Não há migração/cópia manual do banco.
+Ele usa os IDs do seu usuário para manter a pasta gravável sem criar arquivos
+como root. Não rode a API antiga e o container simultaneamente no mesmo banco
+durante a primeira inicialização, quando podem ocorrer mudanças de schema.
+
+O container publica a porta apenas em `127.0.0.1`. `docker compose stop` e
+`docker compose down` preservam os dados nessa pasta. Remover `backend/data/`
+remove os dados. Para replicar em outro computador, leve também um backup
+consistente do SQLite; o banco não é incluído na imagem nem no Git.
+
+Para criar um backup a partir do container:
+
+```sh
+docker compose exec -T app python -m app.backup /data/backup.sqlite3
+```
+
+O arquivo aparecerá em `backend/data/backup.sqlite3`. Escolha outro nome para um
+backup novo, pois o comando não sobrescreve arquivos existentes.
+
+Para operar diretamente com Compose, crie antes `backend/data/` e, se seu usuário
+não tem UID/GID 1000, configure `LOCAL_UID` e `LOCAL_GID` em `.env` com os valores
+de `id -u` e `id -g`. O script faz isso automaticamente. O container não inicia
+sozinho após reiniciar o PC; use novamente `./iniciar.sh`.
+
+As dependências são fixadas por `pnpm-lock.yaml` e `uv.lock`, e o pnpm e o uv têm
+versões fixas no Dockerfile. As imagens base acompanham Node 24 e Python 3.14;
+para uma reprodução bit a bit também seria necessário fixar seus digests.
+
+## Rodar em desenvolvimento
 
 Pré-requisitos: Python 3.12 ou superior, uv, Node.js 22.12 ou superior e pnpm 11.
 
@@ -38,6 +112,22 @@ primeira coleta. Não há vagas fictícias nem coleta de rede durante os testes.
 
 - Fontes iniciais C6 Bank (`c6bank`) e iFood (`ifoodcarreiras`), pela API pública Greenhouse.
 - Cadastro e pausa de outras empresas da Greenhouse pela interface.
+- Cadastro pela URL pública da Greenhouse, com identificação automática do nome
+  pela API e prévia antes de adicionar. Aceita o link do quadro ou de uma vaga,
+  incluindo URLs antigas de `boards.greenhouse.io`.
+- Ícone discreto **✦** ao lado de **Adicionar empresa** abre uma lista especial
+  com sugestões de empresas tech. Cada empresa pode ser adicionada com um clique;
+  empresas já cadastradas ficam sinalizadas. O nome é validado pela API e a
+  coleta só acontece ao buscar vagas.
+- Formulário de cadastro acima das empresas acompanhadas e botão **Remover empresa**.
+  A remoção tira a empresa, suas vagas e coletas das listagens e impede novas
+  buscas. O histórico fica guardado e é recuperado ao cadastrar a mesma empresa
+  novamente. Empresas iniciais removidas não reaparecem ao reiniciar.
+- Seletor de empresas ao lado de **Buscar vagas**, com seleção múltipla e atalhos
+  para todas/nenhuma. A busca consulta somente as selecionadas com coleta ativa.
+- **Restaurar ocultas** recupera todas as vagas ocultas das empresas selecionadas,
+  sem alterar favoritos, notas ou etapas. Inclui vagas indisponíveis e fora dos
+  filtros da listagem; os filtros continuam valendo depois da restauração.
 - Listagem, busca textual e filtros por empresa, área, senioridade e modalidade.
 - Radar inicial de tecnologia em todas as senioridades: Desenvolvimento, DevOps,
   Infraestrutura, IA, Dados, Segurança, Suporte de TI e cargos de departamentos de tecnologia.
@@ -77,11 +167,24 @@ Use `visibility=visible` ou `visibility=hidden` para filtrar vagas ocultas,
 indicados e `PATCH /api/jobs/{id}` com `{"hidden": true}` ou `false` para ocultar/restaurar.
 `language_tags`, `platform_tags`, `requirement_tags` e `affirmative_tags` são calculadas
 a partir dos anúncios já salvos; não exigem nova coleta.
+`POST /api/collect` aceita `{"source_ids": [1, 2]}` para selecionar as fontes;
+sem corpo mantém o comportamento de consultar todas as fontes ativas.
+`POST /api/jobs/restore-hidden` aceita o mesmo corpo e devolve a quantidade e os
+identificadores das vagas restauradas. Uma lista vazia não seleciona nenhuma
+empresa. IDs inexistentes são rejeitados sem modificar vagas.
+`POST /api/sources/resolve` com `{"url": "https://job-boards.greenhouse.io/vtex"}`
+identifica a empresa sem cadastrá-la. `POST /api/sources` com o mesmo corpo
+valida novamente o nome e cadastra/recupera a empresa. A forma antiga com `name`
+e `board` continua disponível na API. `DELETE /api/sources/{id}` remove a empresa
+do acompanhamento, preservando os registros para recuperação futura.
 Os departamentos de origem são preservados a partir da próxima coleta. Vagas já
 salvas são reclassificadas ao consultar a API, sem exigir uma nova busca na rede
 nem alterar favoritos, notas ou etapas de candidaturas.
 
 ## Coleta automática local
+
+Esta seção descreve o coletor contínuo fora do Docker. Para o fluxo diário com
+Docker, `./iniciar.sh` já executa uma coleta pontual e não precisa de `--watch`.
 
 Em um terceiro terminal:
 
@@ -134,7 +237,9 @@ uv run python -m app.backup data/backup.sqlite3
 O SQLite está em modo WAL. Evite copiar somente o arquivo principal enquanto há
 gravações em andamento; use a API de backup acima ou pare os processos antes de copiar.
 
-A aplicação não possui autenticação e deve continuar vinculada a `127.0.0.1`.
+A aplicação não possui autenticação e deve ficar acessível apenas em `127.0.0.1`.
+No Docker, o servidor escuta `0.0.0.0` internamente e o Compose restringe a porta
+publicada ao localhost do computador.
 O texto de vagas é exibido como texto, sem executar o HTML recebido. Não são
 necessários cookies pessoais, credenciais Greenhouse ou serviços de IA.
 

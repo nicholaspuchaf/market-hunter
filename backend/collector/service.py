@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import UTC, datetime, timedelta
 
 from app.db import connect
@@ -56,15 +57,34 @@ def save_snapshot(db, source_id: int, jobs: list[dict], timestamp: str):
     db.execute("UPDATE jobs SET active=0 WHERE source_id=? AND missing_count>=2", (source_id,))
 
 
-def collect(force: bool = False, interval_hours: int = 48) -> dict:
+def collect(
+    force: bool = False,
+    interval_hours: int | None = None,
+    source_ids: list[int] | None = None,
+) -> dict:
+    if interval_hours is None:
+        interval_hours = int(os.environ.get("MARKET_HUNTER_INTERVAL_HOURS", "48"))
+    if interval_hours < 1:
+        raise ValueError("O intervalo de coleta deve ser de pelo menos uma hora")
     results = []
     with connect() as db:
-        sources = [dict(row) for row in db.execute("SELECT * FROM sources WHERE enabled=1")]
+        sources = [
+            dict(row) for row in db.execute("SELECT * FROM sources WHERE enabled=1 AND removed=0")
+        ]
+    if source_ids is not None:
+        selected = set(source_ids)
+        sources = [source for source in sources if source["id"] in selected]
     for source in sources:
         started = now()
         with connect() as db:
             # Atomic cross-process lease: CLI, scheduler and API cannot overlap this source.
             db.execute("BEGIN IMMEDIATE")
+            available = db.execute(
+                "SELECT id FROM sources WHERE id=? AND enabled=1 AND removed=0", (source["id"],)
+            ).fetchone()
+            if not available:
+                results.append({"source": source["name"], "status": "skipped"})
+                continue
             running = db.execute(
                 "SELECT id FROM runs WHERE source_id=? AND status='running' AND started_at>?",
                 (source["id"], (datetime.now(UTC) - timedelta(minutes=10)).isoformat()),
@@ -95,6 +115,16 @@ def collect(force: bool = False, interval_hours: int = 48) -> dict:
         try:
             jobs = fetch_jobs(source["board"])
             with connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                if not db.execute(
+                    "SELECT id FROM sources WHERE id=? AND removed=0", (source["id"],)
+                ).fetchone():
+                    db.execute(
+                        "UPDATE runs SET status='cancelled', finished_at=? WHERE id=?",
+                        (now(), run_id),
+                    )
+                    results.append({"source": source["name"], "status": "skipped"})
+                    continue
                 save_snapshot(db, source["id"], jobs, started)
                 db.execute(
                     "UPDATE sources SET last_success=?, last_error=NULL WHERE id=?",

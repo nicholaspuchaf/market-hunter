@@ -1,9 +1,51 @@
 import re
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
 from collector.classify import classify, plain_text
+
+
+def board_from_url(value: str) -> str:
+    value = value.strip()
+    if "://" not in value:
+        value = "https://" + value
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password or parsed.port:
+        raise ValueError("Use uma URL pública de vagas da Greenhouse")
+    parts = [part for part in parsed.path.split("/") if part]
+    if parsed.hostname in {"job-boards.greenhouse.io", "boards.greenhouse.io"}:
+        if parts and parts[0] == "embed":
+            board = parse_qs(parsed.query).get("for", [""])[0]
+        else:
+            board = parts[0] if parts else ""
+    elif parsed.hostname == "boards-api.greenhouse.io" and parts[:2] == ["v1", "boards"]:
+        board = parts[2] if len(parts) > 2 else ""
+    else:
+        raise ValueError(
+            "Este coletor aceita URLs de job-boards.greenhouse.io ou boards.greenhouse.io"
+        )
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", board):
+        raise ValueError("A URL não contém um identificador válido de empresa na Greenhouse")
+    return board
+
+
+def fetch_board_info(board: str) -> dict:
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", board):
+        raise ValueError("Identificador Greenhouse inválido")
+    # Fetch a known API host, never arbitrary user-provided destinations or redirects.
+    with httpx.Client(timeout=20, follow_redirects=False) as client:
+        response = client.get(f"https://boards-api.greenhouse.io/v1/boards/{board}")
+        response.raise_for_status()
+        payload = response.json()
+    name = payload.get("name") if isinstance(payload, dict) else None
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("A Greenhouse não informou o nome desta empresa")
+    return {
+        "name": name.strip()[:100],
+        "board": board,
+        "url": f"https://job-boards.greenhouse.io/{board}",
+    }
 
 
 def safe_url(value: str) -> str:

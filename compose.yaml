@@ -1,0 +1,26 @@
+name: market-hunter
+
+services:
+  app:
+    build:
+      context: .
+      target: runtime
+    init: true
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    ports:
+      - "127.0.0.1:${MARKET_HUNTER_PORT:-8080}:8000"
+    environment:
+      MARKET_HUNTER_DB: /data/market-hunter.sqlite3
+      MARKET_HUNTER_INTERVAL_HOURS: "${MARKET_HUNTER_INTERVAL_HOURS:-48}"
+    volumes:
+      - type: bind
+        source: ./backend/data
+        target: /data
+        bind:
+          create_host_path: false
+    restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

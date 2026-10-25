@@ -75,6 +75,9 @@ def initialize():
             db.execute("ALTER TABLE jobs ADD COLUMN departments TEXT NOT NULL DEFAULT ''")
         if "hidden" not in columns:
             db.execute("ALTER TABLE jobs ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+        source_columns = {row["name"] for row in db.execute("PRAGMA table_info(sources)")}
+        if "removed" not in source_columns:
+            db.execute("ALTER TABLE sources ADD COLUMN removed INTEGER NOT NULL DEFAULT 0")
         db.executemany(
             "INSERT OR IGNORE INTO sources (name, board) VALUES (?, ?)",
             [("C6 Bank", "c6bank"), ("iFood", "ifoodcarreiras")],

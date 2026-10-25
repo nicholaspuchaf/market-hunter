@@ -1,6 +1,6 @@
 export type Stage = 'new' | 'saved' | 'applied' | 'interview' | 'offer' | 'rejected' | 'archived';
 export type Job = {
-  id: number; company: string; title: string; location: string; url: string;
+  id: number; source_id: number; company: string; title: string; location: string; url: string;
   description: string; categories: string[]; seniority: string; seniority_tags: string[]; work_mode: string;
   language_tags: string[]; platform_tags: string[]; requirement_tags: string[]; affirmative_tags: string[];
   location_fit: string; hidden: boolean; favorite: boolean; active: boolean; stage: Stage; notes: string;

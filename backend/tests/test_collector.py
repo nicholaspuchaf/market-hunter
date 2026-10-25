@@ -181,6 +181,25 @@ def test_collection_interval_and_manual_cooldown(database, monkeypatch):
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize(("hours", "expected"), [(24, "success"), (48, "skipped")])
+def test_interval_can_be_configured_for_daily_use(database, monkeypatch, hours, expected):
+    from datetime import UTC, datetime, timedelta
+
+    monkeypatch.setenv("MARKET_HUNTER_INTERVAL_HOURS", str(hours))
+    monkeypatch.setattr("collector.service.fetch_jobs", lambda board: [sample()])
+    collect()
+    timestamp = (datetime.now(UTC) - timedelta(hours=30)).isoformat()
+    with connect() as db:
+        db.execute("UPDATE runs SET started_at=?", (timestamp,))
+    assert all(item["status"] == expected for item in collect()["results"])
+
+
+def test_invalid_collection_interval_fails_before_fetching(database, monkeypatch):
+    monkeypatch.setenv("MARKET_HUNTER_INTERVAL_HOURS", "0")
+    with pytest.raises(ValueError, match="pelo menos uma hora"):
+        collect()
+
+
 def test_api_tracking_source_validation_and_missing_jobs(database, monkeypatch):
     monkeypatch.setattr("collector.service.fetch_jobs", lambda board: [sample()])
     with TestClient(app) as client:
